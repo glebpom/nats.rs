@@ -1069,6 +1069,19 @@ impl Client {
     pub fn statistics(&self) -> Arc<Statistics> {
         self.connection_stats.clone()
     }
+
+    /// Returns the number of successful connections, including the initial connection.
+    ///
+    /// A publisher can capture this generation before handing over a write and compare it after
+    /// [`Client::flush`] completes. A changed generation means the flush used a replacement
+    /// connection and cannot certify bytes discarded with the preceding connection.
+    ///
+    /// This is an observation of the connection handler, not a request to reconnect and not a
+    /// server acknowledgement. The handler advances it before servicing the replacement
+    /// connection's commands, so a completed flush observes that advance.
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_stats.connects.load(Ordering::Relaxed)
+    }
 }
 
 /// Used for building customized requests.

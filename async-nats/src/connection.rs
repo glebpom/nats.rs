@@ -751,6 +751,7 @@ impl Connection {
     ///
     /// no-op if the write stream didn't need to be flushed.
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        std::task::ready!(self.poll_write(cx))?;
         match Pin::new(&mut self.stream).poll_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
@@ -1201,7 +1202,33 @@ mod write_op {
 
     use super::Connection;
     use crate::{ClientOp, ConnectInfo, HeaderMap, Protocol, Statistics};
-    use tokio::io::{self, AsyncBufReadExt, BufReader};
+    use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    #[tokio::test]
+    async fn flush_waits_for_every_queued_byte_when_the_stream_is_full() {
+        let (stream, mut server) = io::duplex(1);
+        let mut connection = Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
+        connection.enqueue_write_op(&ClientOp::Publish {
+            subject: "events".into(),
+            payload: "payload".into(),
+            respond: None,
+            headers: None,
+        });
+        let flush = std::future::poll_fn(|cx| connection.poll_flush(cx));
+        tokio::pin!(flush);
+        assert!(
+            futures_util::poll!(flush.as_mut()).is_pending(),
+            "flush cannot complete while its queued bytes have not been written"
+        );
+        let expected = b"PUB events 7\r\npayload\r\n";
+        let read = async {
+            let mut received = vec![0; expected.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+        };
+        let (flushed, ()) = tokio::join!(flush, read);
+        flushed.unwrap();
+    }
 
     #[tokio::test]
     async fn publish() {
