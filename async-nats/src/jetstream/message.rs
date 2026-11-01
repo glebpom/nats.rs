@@ -816,7 +816,7 @@ pub struct Info<'a> {
     /// The consumer sequence number associated with this message
     pub consumer_sequence: u64,
     /// The number of delivery attempts for this message
-    pub delivered: i64,
+    pub delivered: u64,
     /// the number of messages known by the server to be pending to this consumer
     pub pending: u64,
     /// the time that this message was received by the server from its publisher
@@ -828,6 +828,14 @@ pub struct Info<'a> {
 #[cfg(test)]
 mod metadata_tests {
     use super::Info;
+
+    #[test]
+    fn delivery_counts_keep_the_complete_unsigned_range() {
+        let subject = "$JS.ACK._.account.orders.reader.18446744073709551615.18446744073709551615.3.1730000000000000000.0.token";
+        let info = Info::from_reply(subject).unwrap();
+        assert_eq!(info.delivered, u64::MAX);
+        assert_eq!(info.stream_sequence, u64::MAX);
+    }
 
     #[test]
     fn delivery_metadata_can_be_borrowed_without_a_client() {
