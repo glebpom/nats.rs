@@ -48,7 +48,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMap {
-    inner: ListOrderedMultimap<HeaderName, HeaderValue>,
+    // Keep the optional header block small inside each Message while retaining indexed lookup
+    // and the complete pair order.
+    inner: Box<ListOrderedMultimap<HeaderName, HeaderValue>>,
 }
 
 // Header-map equality compares each name's values, as the JSON object representation does.
@@ -199,7 +201,7 @@ impl HeaderMap {
     pub(crate) fn wire_len(&self) -> usize {
         // Mirrors `to_bytes`: "NATS/1.0\r\n" + each "<key>: <value>\r\n" + "\r\n".
         let mut len = b"NATS/1.0\r\n".len() + b"\r\n".len();
-        for (k, v) in &self.inner {
+        for (k, v) in self.inner.iter() {
             len += k.as_str().len() + b": ".len() + v.inner.len() + b"\r\n".len();
         }
         len
@@ -291,7 +293,7 @@ impl HeaderMap {
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![];
         buf.extend_from_slice(b"NATS/1.0\r\n");
-        for (k, v) in &self.inner {
+        for (k, v) in self.inner.iter() {
             buf.extend_from_slice(k.as_str().as_bytes());
             buf.extend_from_slice(b": ");
             buf.extend_from_slice(v.inner.as_bytes());
