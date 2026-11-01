@@ -1114,6 +1114,34 @@ mod read_op {
     }
 
     #[tokio::test]
+    async fn interleaved_headers_survive_wire_decoding() {
+        let (stream, mut server) = io::duplex(512);
+        let mut connection = Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
+        let headers = b"NATS/1.0\r\nfirst: one\r\nsecond: two\r\nfirst: three\r\n\r\n";
+        let prefix = format!("HMSG events 9 {} {}\r\n", headers.len(), headers.len() + 5);
+        server.write_all(prefix.as_bytes()).await.unwrap();
+        server.write_all(headers).await.unwrap();
+        server.write_all(b"event\r\n").await.unwrap();
+        let Some(ServerOp::Message {
+            headers: Some(decoded),
+            payload,
+            ..
+        }) = connection.read_op().await.unwrap()
+        else {
+            panic!("the frame carries one message with headers");
+        };
+        assert_eq!(decoded.to_bytes(), headers);
+        assert_eq!(payload.as_ref(), b"event");
+        assert_eq!(
+            decoded
+                .iter_ordered()
+                .map(|(name, value)| (name.as_ref(), value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "one"), ("second", "two"), ("first", "three")]
+        );
+    }
+
+    #[tokio::test]
     async fn unknown() {
         let (stream, mut server) = io::duplex(128);
         let mut connection = Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));

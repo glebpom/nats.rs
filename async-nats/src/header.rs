@@ -20,9 +20,11 @@
 
 //! NATS [Message][crate::Message] headers, modeled loosely after the `http::header` crate.
 
-use std::{collections::HashMap, fmt, slice::Iter, str::FromStr};
+use std::{collections::HashMap, fmt, str::FromStr};
 
 use bytes::Bytes;
+use ordered_multimap::{list_ordered_multimap::EntryValues, ListOrderedMultimap};
+use serde::ser::SerializeMap as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A struct for handling NATS headers.
@@ -44,10 +46,24 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// # }
 /// ```
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct HeaderMap {
-    inner: HashMap<HeaderName, Vec<HeaderValue>>,
+    inner: ListOrderedMultimap<HeaderName, HeaderValue>,
 }
+
+// Header-map equality compares each name's values, as the JSON object representation does.
+// Wire order is available through iter_ordered and is retained independently of this comparison.
+impl PartialEq for HeaderMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .inner
+                .keys()
+                .all(|name| self.inner.get_all(name).eq(other.inner.get_all(name)))
+    }
+}
+
+impl Eq for HeaderMap {}
 
 /// Helper enum for backward-compatible deserialization using serde's untagged feature
 /// This is required because of the bug #1470 where the client incorrectly serialized
@@ -71,10 +87,17 @@ impl<'de> Deserialize<'de> for HeaderMap {
         // Use the untagged enum to automatically try both formats
         let helper = HeaderMapHelper::deserialize(deserializer)?;
 
-        Ok(match helper {
-            HeaderMapHelper::Legacy { inner } => HeaderMap { inner },
-            HeaderMapHelper::Current(inner) => HeaderMap { inner },
-        })
+        let pairs = match helper {
+            HeaderMapHelper::Legacy { inner } => inner,
+            HeaderMapHelper::Current(inner) => inner,
+        };
+        let mut headers = HeaderMap::new();
+        for (name, values) in pairs {
+            for value in values {
+                headers.append(name.clone(), value);
+            }
+        }
+        Ok(headers)
     }
 }
 
@@ -83,8 +106,11 @@ impl Serialize for HeaderMap {
     where
         S: Serializer,
     {
-        // Serialize as the new format (direct HashMap without "inner" wrapper)
-        self.inner.serialize(serializer)
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (name, values) in self.iter() {
+            map.serialize_entry(name, &values.collect::<Vec<_>>())?;
+        }
+        map.end()
     }
 }
 
@@ -99,13 +125,27 @@ impl FromIterator<(HeaderName, HeaderValue)> for HeaderMap {
 }
 
 impl HeaderMap {
-    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, HeaderName, Vec<HeaderValue>> {
+    /// Each name with its values in insertion order. Use [`Self::iter_ordered`] to retain
+    /// interleaving between names.
+    pub fn iter(&self) -> impl Iterator<Item = (&HeaderName, GetAll<'_, HeaderValue>)> {
+        self.inner.keys().map(|name| {
+            (
+                name,
+                GetAll {
+                    inner: self.inner.get_all(name),
+                },
+            )
+        })
+    }
+
+    /// Every header pair in insertion order, including interleaved repeated names.
+    pub fn iter_ordered(&self) -> impl Iterator<Item = (&HeaderName, &HeaderValue)> {
         self.inner.iter()
     }
 }
 
 pub struct GetAll<'a, T> {
-    inner: Iter<'a, T>,
+    inner: EntryValues<'a, HeaderName, T>,
 }
 
 impl<'a, T> Iterator for GetAll<'a, T> {
@@ -151,7 +191,7 @@ impl HeaderMap {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.keys_len()
     }
 
     /// Serialized byte length of this header block (as [`HeaderMap::to_bytes`]
@@ -159,10 +199,8 @@ impl HeaderMap {
     pub(crate) fn wire_len(&self) -> usize {
         // Mirrors `to_bytes`: "NATS/1.0\r\n" + each "<key>: <value>\r\n" + "\r\n".
         let mut len = b"NATS/1.0\r\n".len() + b"\r\n".len();
-        for (k, vs) in &self.inner {
-            for v in vs.iter() {
-                len += k.as_str().len() + b": ".len() + v.inner.len() + b"\r\n".len();
-            }
+        for (k, v) in &self.inner {
+            len += k.as_str().len() + b": ".len() + v.inner.len() + b"\r\n".len();
         }
         len
     }
@@ -181,7 +219,7 @@ impl HeaderMap {
     /// ```
     pub fn insert<K: IntoHeaderName, V: IntoHeaderValue>(&mut self, name: K, value: V) {
         self.inner
-            .insert(name.into_header_name(), vec![value.into_header_value()]);
+            .insert_all(name.into_header_name(), value.into_header_value());
     }
 
     /// Appends a new value to the list of values to a given key.
@@ -196,16 +234,8 @@ impl HeaderMap {
     /// headers.append("Key", "Value");
     /// headers.append("Key", "Another");
     pub fn append<K: IntoHeaderName, V: IntoHeaderValue>(&mut self, name: K, value: V) {
-        let key = name.into_header_name();
-        let v = self.inner.get_mut(&key);
-        match v {
-            Some(v) => {
-                v.push(value.into_header_value());
-            }
-            None => {
-                self.insert(key, value.into_header_value());
-            }
-        }
+        self.inner
+            .append(name.into_header_name(), value.into_header_value());
     }
 
     /// Gets a value for a given key. If key is not found, [Option::None] is returned.
@@ -220,9 +250,7 @@ impl HeaderMap {
     /// let values = headers.get("Key").unwrap();
     /// ```
     pub fn get<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        self.inner
-            .get(&key.into_header_name())
-            .and_then(|x| x.first())
+        self.inner.get(&key.into_header_name())
     }
 
     /// Gets a last value for a given key. If key is not found, [Option::None] is returned.
@@ -237,9 +265,7 @@ impl HeaderMap {
     /// let values = headers.get_last("Key").unwrap();
     /// ```
     pub fn get_last<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        self.inner
-            .get(&key.into_header_name())
-            .and_then(|x| x.last())
+        self.inner.get_all(&key.into_header_name()).next_back()
     }
 
     /// Gets an iterator to the values for a given key.
@@ -257,11 +283,7 @@ impl HeaderMap {
     /// let value2 = values.next();
     /// ```
     pub fn get_all<K: IntoHeaderName>(&self, key: K) -> GetAll<'_, HeaderValue> {
-        let inner = self
-            .inner
-            .get(&key.into_header_name())
-            .map(|x| x.iter())
-            .unwrap_or([].iter());
+        let inner = self.inner.get_all(&key.into_header_name());
 
         GetAll { inner }
     }
@@ -269,13 +291,11 @@ impl HeaderMap {
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![];
         buf.extend_from_slice(b"NATS/1.0\r\n");
-        for (k, vs) in &self.inner {
-            for v in vs.iter() {
-                buf.extend_from_slice(k.as_str().as_bytes());
-                buf.extend_from_slice(b": ");
-                buf.extend_from_slice(v.inner.as_bytes());
-                buf.extend_from_slice(b"\r\n");
-            }
+        for (k, v) in &self.inner {
+            buf.extend_from_slice(k.as_str().as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(v.inner.as_bytes());
+            buf.extend_from_slice(b"\r\n");
         }
         buf.extend_from_slice(b"\r\n");
         buf
@@ -843,6 +863,19 @@ fn validate_header_name(s: &str) -> Result<(), ParseHeaderNameError> {
 mod tests {
     use super::{HeaderMap, HeaderName, HeaderValue, IntoHeaderName, IntoHeaderValue};
     use std::str::{from_utf8, FromStr};
+
+    #[test]
+    fn interleaved_headers_keep_wire_order() {
+        let mut headers = HeaderMap::new();
+        headers.append("first", "one");
+        headers.append("second", "two");
+        headers.append("first", "three");
+        assert_eq!(
+            headers.to_bytes(),
+            b"NATS/1.0\r\nfirst: one\r\nsecond: two\r\nfirst: three\r\n\r\n"
+        );
+        assert_eq!(headers.wire_len(), headers.to_bytes().len());
+    }
 
     #[test]
     fn try_from() {
