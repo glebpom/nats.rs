@@ -433,12 +433,19 @@ impl Message {
     /// if this is a `JetStream` message.
     #[allow(clippy::mixed_read_write_in_expression)]
     pub fn info(&self) -> Result<Info<'_>, Error> {
-        const PREFIX: &str = "$JS.ACK.";
-        const SKIP: usize = PREFIX.len();
-
-        let mut reply: &str = self.reply.as_ref().ok_or_else(|| {
+        let reply = self.reply.as_ref().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "did not found reply subject")
         })?;
+        Info::from_reply(reply.as_str())
+    }
+}
+
+impl<'a> Info<'a> {
+    /// Reads JetStream delivery metadata from its acknowledgement subject without a client.
+    /// The returned names borrow the subject and parsing allocates no successful result.
+    pub fn from_reply(reply: &'a str) -> Result<Self, Error> {
+        const PREFIX: &str = "$JS.ACK.";
+        const SKIP: usize = PREFIX.len();
 
         if !reply.starts_with(PREFIX) {
             return Err(Box::new(std::io::Error::other(
@@ -446,7 +453,7 @@ impl Message {
             )));
         }
 
-        reply = &reply[SKIP..];
+        let reply = &reply[SKIP..];
 
         let mut split = reply.split('.');
 
@@ -816,4 +823,32 @@ pub struct Info<'a> {
     pub published: time::OffsetDateTime,
     /// Optional token, present in servers post-ADR-15
     pub token: Option<&'a str>,
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::Info;
+
+    #[test]
+    fn delivery_metadata_can_be_borrowed_without_a_client() {
+        let subject = "$JS.ACK._.account.orders.reader.2.7.3.1730000000000000000.4.token";
+        let info = Info::from_reply(subject).unwrap();
+        assert_eq!(info.stream, "orders");
+        assert_eq!(info.consumer, "reader");
+        assert_eq!(info.delivered, 2);
+        assert_eq!(info.stream_sequence, 7);
+        assert_eq!(info.consumer_sequence, 3);
+        assert_eq!(
+            info.published.unix_timestamp_nanos(),
+            1_730_000_000_000_000_000
+        );
+        assert_eq!(info.pending, 4);
+        assert_eq!(info.token, Some("token"));
+    }
+
+    #[test]
+    fn a_subject_without_delivery_metadata_is_refused() {
+        assert!(Info::from_reply("application.reply").is_err());
+        assert!(Info::from_reply("$JS.ACK._.account.orders").is_err());
+    }
 }
