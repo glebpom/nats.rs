@@ -1180,6 +1180,39 @@ mod read_op {
         }
     }
 
+    #[test]
+    fn unicode_continuations_keep_the_complete_frame_valid() {
+        let headers = format!(
+            "NATS/1.0\r\n{}\r\n",
+            "second: \u{2003}雪 \r\n  tail-λ\r\n".repeat(8)
+        );
+        let frame = format!(
+            "HMSG events 1 {} {}\r\n{}",
+            headers.len(),
+            headers.len() + 3,
+            headers
+        );
+        let mut bytes = frame.into_bytes();
+        bytes.extend_from_slice(&[0, 0, 0, b'\r', b'\n']);
+        let (stream, _) = io::duplex(1);
+        let mut connection = Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
+        connection.ordered_headers = true;
+        connection.read_buf = bytes::BytesMut::from(bytes.as_slice());
+        let Some(ServerOp::Message {
+            headers: Some(headers),
+            payload,
+            ..
+        }) = connection.try_read_op().unwrap()
+        else {
+            panic!("one complete frame");
+        };
+        assert_eq!(
+            headers.iter_ordered().collect::<Vec<_>>(),
+            vec![("second", "雪   tail-λ"); 8]
+        );
+        assert_eq!(payload.as_ref(), [0, 0, 0]);
+    }
+
     #[tokio::test]
     async fn interleaved_headers_survive_wire_decoding() {
         let (stream, mut server) = io::duplex(512);
