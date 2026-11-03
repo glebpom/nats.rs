@@ -29,6 +29,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use serde::ser::SerializeMap as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A struct for handling NATS headers.
@@ -52,34 +53,28 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMap {
-    inner: HeaderStorage,
+    inner: Option<Arc<HeaderStorage>>,
 }
 
 #[derive(Clone, Debug)]
 enum HeaderStorage {
     Indexed(HashMap<HeaderName, Vec<HeaderValue>>),
-    Projection(Arc<HeaderProjection>),
+    Projection(HeaderProjection),
 }
 
-impl Default for HeaderStorage {
-    fn default() -> Self {
-        Self::Indexed(HashMap::new())
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum TransportHeaders {
     Received(ReceivedHeaders),
     Ordered(OrderedHeaders),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ReceivedHeaders {
     text: HeaderText,
     pairs: smallvec::SmallVec<[HeaderIndex; 1]>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct HeaderIndex {
     name_start: u32,
     name_end: u32,
@@ -87,14 +82,14 @@ struct HeaderIndex {
     value_end: u32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OrderedHeaders {
     pairs: Vec<(String, String)>,
     message_id: Option<HeaderValue>,
     expected_stream: Option<HeaderValue>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct HeaderProjection {
     data: TransportHeaders,
     indexed: OnceLock<HashMap<HeaderName, Vec<HeaderValue>>>,
@@ -102,19 +97,23 @@ struct HeaderProjection {
 
 impl PartialEq for HeaderMap {
     fn eq(&self, other: &Self) -> bool {
-        self.indexed() == other.indexed()
+        match (self.indexed(), other.indexed()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => true,
+            (Some(values), None) | (None, Some(values)) => values.is_empty(),
+        }
     }
 }
 
 impl Eq for HeaderMap {}
 
 impl HeaderMap {
-    fn indexed(&self) -> &HashMap<HeaderName, Vec<HeaderValue>> {
-        let cache = match &self.inner {
-            HeaderStorage::Indexed(values) => return values,
+    fn indexed(&self) -> Option<&HashMap<HeaderName, Vec<HeaderValue>>> {
+        let cache = match self.inner.as_deref()? {
+            HeaderStorage::Indexed(values) => return Some(values),
             HeaderStorage::Projection(projection) => &projection.indexed,
         };
-        cache.get_or_init(|| {
+        Some(cache.get_or_init(|| {
             let mut values = HashMap::<HeaderName, Vec<HeaderValue>>::new();
             for (name, value) in self.iter_ordered() {
                 values
@@ -123,16 +122,40 @@ impl HeaderMap {
                     .push(HeaderValue::from(value));
             }
             values
-        })
+        }))
     }
 
     fn indexed_mut(&mut self) -> &mut HashMap<HeaderName, Vec<HeaderValue>> {
-        if !matches!(&self.inner, HeaderStorage::Indexed(_)) {
-            self.inner = HeaderStorage::Indexed(self.indexed().clone());
+        if matches!(self.inner.as_deref(), Some(HeaderStorage::Projection(_))) {
+            self.inner = Some(Arc::new(HeaderStorage::Indexed(
+                self.indexed().expect("a projection has an index").clone(),
+            )));
         }
-        match &mut self.inner {
+        let storage = self
+            .inner
+            .get_or_insert_with(|| Arc::new(HeaderStorage::Indexed(HashMap::new())));
+        match Arc::make_mut(storage) {
             HeaderStorage::Indexed(values) => values,
             HeaderStorage::Projection(_) => unreachable!(),
+        }
+    }
+
+    fn from_indexed(values: HashMap<HeaderName, Vec<HeaderValue>>) -> Self {
+        if values.is_empty() {
+            Self::new()
+        } else {
+            Self {
+                inner: Some(Arc::new(HeaderStorage::Indexed(values))),
+            }
+        }
+    }
+
+    fn projection(data: TransportHeaders) -> Self {
+        Self {
+            inner: Some(Arc::new(HeaderStorage::Projection(HeaderProjection {
+                data,
+                indexed: OnceLock::new(),
+            }))),
         }
     }
 
@@ -146,16 +169,11 @@ impl HeaderMap {
             assert!(validate_header_name(name).is_ok(), "invalid header name");
             assert!(validate_header_value(value).is_ok(), "invalid header value");
         }
-        Self {
-            inner: HeaderStorage::Projection(Arc::new(HeaderProjection {
-                data: TransportHeaders::Ordered(OrderedHeaders {
-                    pairs,
-                    message_id: None,
-                    expected_stream: None,
-                }),
-                indexed: OnceLock::new(),
-            })),
-        }
+        Self::projection(TransportHeaders::Ordered(OrderedHeaders {
+            pairs,
+            message_id: None,
+            expected_stream: None,
+        }))
     }
 
     /// Stream publication keeps its reserved overrides outside the owned ordered vector,
@@ -169,27 +187,15 @@ impl HeaderMap {
             name != NATS_EXPECTED_STREAM.as_str()
                 && (message_id.is_none() || name != NATS_MESSAGE_ID.as_str())
         });
-        if pairs.is_empty() {
-            let mut headers = Self::new();
-            if let Some(id) = message_id {
-                headers.insert(NATS_MESSAGE_ID, id);
-            }
-            headers.insert(NATS_EXPECTED_STREAM, stream);
-            return headers;
+        for (name, value) in &pairs {
+            assert!(validate_header_name(name).is_ok(), "invalid header name");
+            assert!(validate_header_value(value).is_ok(), "invalid header value");
         }
-        let mut headers = Self::from_ordered(pairs);
-        let HeaderStorage::Projection(ordered) = &mut headers.inner else {
-            unreachable!()
-        };
-        let TransportHeaders::Ordered(data) = &mut Arc::get_mut(ordered)
-            .expect("new projection is exclusively owned")
-            .data
-        else {
-            unreachable!()
-        };
-        data.message_id = message_id.map(HeaderValue::from);
-        data.expected_stream = Some(HeaderValue::from(stream));
-        headers
+        Self::projection(TransportHeaders::Ordered(OrderedHeaders {
+            pairs,
+            message_id: message_id.map(HeaderValue::from),
+            expected_stream: Some(HeaderValue::from(stream)),
+        }))
     }
 
     /// Validate and index the received block without copying names or values. A NATS server's
@@ -269,22 +275,19 @@ impl HeaderMap {
             }
             pair.value_end = offset(written)?;
         }
-        Ok(Self {
-            inner: HeaderStorage::Projection(Arc::new(HeaderProjection {
-                data: TransportHeaders::Received(ReceivedHeaders {
-                    text: HeaderText {
-                        bytes: block.freeze(),
-                    },
-                    pairs,
-                }),
-                indexed: OnceLock::new(),
-            })),
-        })
+        Ok(Self::projection(TransportHeaders::Received(
+            ReceivedHeaders {
+                text: HeaderText {
+                    bytes: block.freeze(),
+                },
+                pairs,
+            },
+        )))
     }
 
     /// Borrow the first value without constructing the indexed SDK projection.
     pub fn get_str(&self, name: &'static str) -> Option<&str> {
-        match &self.inner {
+        match self.inner.as_deref()? {
             HeaderStorage::Indexed(values) => values
                 .get(&HeaderName::from_static(name))?
                 .first()
@@ -298,12 +301,12 @@ impl HeaderMap {
     /// Borrow every pair in its transport position. Indexed authoring maps group their values.
     pub fn iter_ordered(&self) -> HeaderPairs<'_> {
         HeaderPairs {
-            inner: match &self.inner {
-                HeaderStorage::Indexed(values) => HeaderPairsInner::Indexed {
+            inner: match self.inner.as_deref() {
+                Some(HeaderStorage::Indexed(values)) => HeaderPairsInner::Indexed {
                     entries: values.iter(),
                     values: None,
                 },
-                HeaderStorage::Projection(projection) => match &projection.data {
+                Some(HeaderStorage::Projection(projection)) => match &projection.data {
                     TransportHeaders::Received(block) => HeaderPairsInner::Block {
                         text: block.text.as_str(),
                         pairs: block.pairs.iter(),
@@ -314,6 +317,7 @@ impl HeaderMap {
                         expected_stream: pairs.expected_stream.as_ref(),
                     },
                 },
+                None => HeaderPairsInner::Empty,
             },
         }
     }
@@ -325,6 +329,7 @@ pub struct HeaderPairs<'a> {
 }
 
 enum HeaderPairsInner<'a> {
+    Empty,
     Indexed {
         entries: std::collections::hash_map::Iter<'a, HeaderName, Vec<HeaderValue>>,
         values: Option<(&'a HeaderName, std::slice::Iter<'a, HeaderValue>)>,
@@ -344,6 +349,7 @@ impl<'a> Iterator for HeaderPairs<'a> {
     type Item = (&'a str, &'a str);
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
+            HeaderPairsInner::Empty => None,
             HeaderPairsInner::Indexed { entries, values } => loop {
                 if let Some((name, current)) = values {
                     if let Some(value) = current.next() {
@@ -403,12 +409,8 @@ impl<'de> Deserialize<'de> for HeaderMap {
         let helper = HeaderMapHelper::deserialize(deserializer)?;
 
         Ok(match helper {
-            HeaderMapHelper::Legacy { inner } => HeaderMap {
-                inner: HeaderStorage::Indexed(inner),
-            },
-            HeaderMapHelper::Current(inner) => HeaderMap {
-                inner: HeaderStorage::Indexed(inner),
-            },
+            HeaderMapHelper::Legacy { inner } => HeaderMap::from_indexed(inner),
+            HeaderMapHelper::Current(inner) => HeaderMap::from_indexed(inner),
         })
     }
 }
@@ -419,7 +421,10 @@ impl Serialize for HeaderMap {
         S: Serializer,
     {
         // Serialize as the new format (direct HashMap without "inner" wrapper)
-        self.indexed().serialize(serializer)
+        match self.indexed() {
+            Some(values) => values.serialize(serializer),
+            None => serializer.serialize_map(Some(0))?.end(),
+        }
     }
 }
 
@@ -434,10 +439,29 @@ impl FromIterator<(HeaderName, HeaderValue)> for HeaderMap {
 }
 
 impl HeaderMap {
-    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, HeaderName, Vec<HeaderValue>> {
-        self.indexed().iter()
+    pub fn iter(&self) -> HeaderIter<'_> {
+        HeaderIter {
+            inner: self.indexed().map(HashMap::iter),
+        }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct HeaderIter<'a> {
+    inner: Option<std::collections::hash_map::Iter<'a, HeaderName, Vec<HeaderValue>>>,
+}
+impl<'a> Iterator for HeaderIter<'a> {
+    type Item = (&'a HeaderName, &'a Vec<HeaderValue>);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.as_mut()?.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.inner.as_ref().map_or(0, ExactSizeIterator::len);
+        (len, Some(len))
+    }
+}
+impl ExactSizeIterator for HeaderIter<'_> {}
+impl std::iter::FusedIterator for HeaderIter<'_> {}
 
 pub struct GetAll<'a, T> {
     inner: Iter<'a, T>,
@@ -485,14 +509,15 @@ impl HeaderMap {
     /// assert!(!map.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        match &self.inner {
-            HeaderStorage::Indexed(values) => values.is_empty(),
-            HeaderStorage::Projection(_) => false,
+        match self.inner.as_deref() {
+            None => true,
+            Some(HeaderStorage::Indexed(values)) => values.is_empty(),
+            Some(HeaderStorage::Projection(_)) => false,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.indexed().len()
+        self.indexed().map_or(0, HashMap::len)
     }
 
     /// Serialized byte length of this header block (as [`HeaderMap::to_bytes`]
@@ -560,7 +585,7 @@ impl HeaderMap {
     /// let values = headers.get("Key").unwrap();
     /// ```
     pub fn get<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        self.indexed()
+        self.indexed()?
             .get(&key.into_header_name())
             .and_then(|x| x.first())
     }
@@ -577,7 +602,7 @@ impl HeaderMap {
     /// let values = headers.get_last("Key").unwrap();
     /// ```
     pub fn get_last<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        self.indexed()
+        self.indexed()?
             .get(&key.into_header_name())
             .and_then(|x| x.last())
     }
@@ -599,7 +624,7 @@ impl HeaderMap {
     pub fn get_all<K: IntoHeaderName>(&self, key: K) -> GetAll<'_, HeaderValue> {
         let inner = self
             .indexed()
-            .get(&key.into_header_name())
+            .and_then(|values| values.get(&key.into_header_name()))
             .map(|x| x.iter())
             .unwrap_or([].iter());
 
@@ -607,9 +632,10 @@ impl HeaderMap {
     }
 
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = match &self.inner {
-            HeaderStorage::Indexed(_) => Vec::new(),
-            HeaderStorage::Projection(_) => Vec::with_capacity(self.wire_len()),
+        let mut buf = if matches!(self.inner.as_deref(), Some(HeaderStorage::Projection(_))) {
+            Vec::with_capacity(self.wire_len())
+        } else {
+            Vec::new()
         };
         buf.extend_from_slice(b"NATS/1.0\r\n");
         for (name, value) in self.iter_ordered() {
@@ -1189,9 +1215,20 @@ mod tests {
 
     #[test]
     fn transport_projection_keeps_the_indexed_map_footprint() {
-        assert_eq!(
-            std::mem::size_of::<HeaderMap>(),
-            std::mem::size_of::<std::collections::HashMap<HeaderName, Vec<HeaderValue>>>()
+        println!("transport layouts: header={} optional={} indexed={} optional_indexed={} message={} outbound={}",
+            std::mem::size_of::<HeaderMap>(),std::mem::size_of::<Option<HeaderMap>>(),
+            std::mem::size_of::<std::collections::HashMap<HeaderName,Vec<HeaderValue>>>(),
+            std::mem::size_of::<Option<std::collections::HashMap<HeaderName,Vec<HeaderValue>>>>(),
+            std::mem::size_of::<crate::Message>(),std::mem::size_of::<crate::message::OutboundMessage>());
+        assert!(
+            std::mem::size_of::<HeaderMap>()
+                <= std::mem::size_of::<std::collections::HashMap<HeaderName, Vec<HeaderValue>>>()
+        );
+        assert!(
+            std::mem::size_of::<Option<HeaderMap>>()
+                <= std::mem::size_of::<
+                    Option<std::collections::HashMap<HeaderName, Vec<HeaderValue>>>,
+                >()
         );
     }
 
@@ -1219,10 +1256,11 @@ mod tests {
             assert_eq!(allocated.count_total, 1);
             assert_eq!(
                 allocated.bytes_total,
-                (std::mem::size_of::<super::HeaderProjection>() + 2 * std::mem::size_of::<usize>())
+                (std::mem::size_of::<super::HeaderStorage>() + 2 * std::mem::size_of::<usize>())
                     as u64
             );
-            let super::HeaderStorage::Projection(projection) = &retained.as_ref().unwrap().inner
+            let super::HeaderStorage::Projection(projection) =
+                retained.as_ref().unwrap().inner.as_deref().unwrap()
             else {
                 panic!("ordered projection");
             };
@@ -1260,10 +1298,12 @@ mod tests {
         assert!(
             allocated.bytes_total
                 <= (2 * 32 * std::mem::size_of::<super::HeaderIndex>()
-                    + std::mem::size_of::<super::HeaderProjection>()
+                    + std::mem::size_of::<super::HeaderStorage>()
                     + 2 * std::mem::size_of::<usize>()) as u64
         );
-        let super::HeaderStorage::Projection(projection) = &retained.as_ref().unwrap().inner else {
+        let super::HeaderStorage::Projection(projection) =
+            retained.as_ref().unwrap().inner.as_deref().unwrap()
+        else {
             panic!("received block");
         };
         let super::TransportHeaders::Received(block) = &projection.data else {
