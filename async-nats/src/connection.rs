@@ -91,6 +91,7 @@ pub(crate) struct Connection {
     write_buf_len: usize,
     flattened_writes: BytesMut,
     can_flush: bool,
+    pub(crate) ordered_headers: bool,
     statistics: Arc<Statistics>,
 }
 
@@ -109,6 +110,7 @@ impl Connection {
             write_buf_len: 0,
             flattened_writes: BytesMut::new(),
             can_flush: false,
+            ordered_headers: false,
             statistics,
         }
     }
@@ -331,7 +333,12 @@ impl Connection {
             let payload = self.read_buf.split_to(total_len - header_len).freeze();
             self.read_buf.advance(2);
 
-            let mut lines = std::str::from_utf8(&header)
+            let version_end = if self.ordered_headers {
+                memchr::memchr(b'\n', &header).map_or(header.len(), |offset| offset + 1)
+            } else {
+                header.len()
+            };
+            let mut lines = std::str::from_utf8(&header[..version_end])
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "header isn't valid utf-8")
                 })?
@@ -370,29 +377,34 @@ impl Connection {
                 None
             };
 
-            let mut headers = HeaderMap::new();
-            while let Some(line) = lines.next() {
-                if line.is_empty() {
-                    continue;
+            let headers = if self.ordered_headers {
+                HeaderMap::from_received(header)?
+            } else {
+                let mut headers = HeaderMap::new();
+                while let Some(line) = lines.next() {
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let (name, value) = line.split_once(':').ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
+                    })?;
+
+                    let name = HeaderName::from_str(name)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
+                    // Read the header value, which might have been split into multiple lines
+                    // `trim_start` and `trim_end` do the same job as doing `value.trim().to_owned()` at the end, but without a reallocation
+                    let mut value = value.trim_start().to_owned();
+                    while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
+                        value.push_str(v);
+                    }
+                    value.truncate(value.trim_end().len());
+
+                    headers.append(name, value.into_header_value());
                 }
-
-                let (name, value) = line.split_once(':').ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
-                })?;
-
-                let name = HeaderName::from_str(name)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-
-                // Read the header value, which might have been split into multiple lines
-                // `trim_start` and `trim_end` do the same job as doing `value.trim().to_owned()` at the end, but without a reallocation
-                let mut value = value.trim_start().to_owned();
-                while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
-                    value.push_str(v);
-                }
-                value.truncate(value.trim_end().len());
-
-                headers.append(name, value.into_header_value());
-            }
+                headers
+            };
 
             trace!(
                 subject = %subject,
@@ -1113,10 +1125,66 @@ mod read_op {
         );
     }
 
+    #[test]
+    fn transport_projection_costs_are_bounded_by_the_indexed_decoder() {
+        for (names, repeats, name_len, value_len, samples) in [
+            (1, 1, 3, 5, 512),
+            (1, 32, 8192, 5, 64),
+            (16, 1, 3, 5, 512),
+            (4, 8, 3, 5, 512),
+            (1, 1, 3, 65536, 64),
+        ] {
+            let mut block = String::from("NATS/1.0\r\n");
+            for name in 0..names {
+                for _ in 0..repeats {
+                    block.push_str(&format!(
+                        "X-{name}{}: {}\r\n",
+                        "n".repeat(name_len),
+                        "v".repeat(value_len)
+                    ));
+                }
+            }
+            block.push_str("\r\n");
+            let frame = format!(
+                "HMSG events 1 {} {}\r\n{}{{}}\r\n",
+                block.len(),
+                block.len() + 2,
+                block
+            );
+            let mut results = Vec::new();
+            for ordered in [false, true] {
+                let mut inputs = (0..samples)
+                    .map(|_| {
+                        let (stream, _) = io::duplex(1);
+                        let mut connection =
+                            Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
+                        connection.ordered_headers = ordered;
+                        connection.read_buf = bytes::BytesMut::from(frame.as_bytes());
+                        connection
+                    })
+                    .collect::<Vec<_>>();
+                let mut messages = Vec::with_capacity(samples);
+                let started = std::time::Instant::now();
+                let allocated = allocation_counter::measure(|| {
+                    for connection in &mut inputs {
+                        messages.push(connection.try_read_op().unwrap().unwrap());
+                    }
+                });
+                let elapsed = started.elapsed();
+                println!("decoder names={names} repeats={repeats} name_len={name_len} value_len={value_len} samples={samples} ordered={ordered}: {allocated:?}, elapsed={elapsed:?}");
+                results.push(allocated);
+                assert_eq!(messages.len(), samples);
+            }
+            assert!(results[1].count_total < results[0].count_total);
+            assert!(results[1].bytes_total < results[0].bytes_total);
+        }
+    }
+
     #[tokio::test]
     async fn interleaved_headers_survive_wire_decoding() {
         let (stream, mut server) = io::duplex(512);
         let mut connection = Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
+        connection.ordered_headers = true;
         let headers = b"NATS/1.0\r\nfirst: one\r\nsecond: two\r\nfirst: three\r\n\r\n";
         let prefix = format!("HMSG events 9 {} {}\r\n", headers.len(), headers.len() + 5);
         server.write_all(prefix.as_bytes()).await.unwrap();
@@ -1135,7 +1203,7 @@ mod read_op {
         assert_eq!(
             decoded
                 .iter_ordered()
-                .map(|(name, value)| (name.as_ref(), value.as_str()))
+                .map(|(name, value)| (name, value))
                 .collect::<Vec<_>>(),
             vec![("first", "one"), ("second", "two"), ("first", "three")]
         );

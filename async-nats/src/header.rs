@@ -20,14 +20,16 @@
 
 //! NATS [Message][crate::Message] headers, modeled loosely after the `http::header` crate.
 
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{
+    collections::HashMap,
+    fmt,
+    slice::Iter,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+};
 
-use bytes::Bytes;
-use ordered_multimap::{list_ordered_multimap::EntryValues, ListOrderedMultimap};
-use serde::ser::{SerializeMap as _, SerializeSeq as _};
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-type HeaderEntries = ListOrderedMultimap<HeaderName, Option<HeaderValue>>;
 
 /// A struct for handling NATS headers.
 /// Has a similar API to `http::header`, but properly serializes and deserializes
@@ -50,31 +52,333 @@ type HeaderEntries = ListOrderedMultimap<HeaderName, Option<HeaderValue>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMap {
-    // Storage starts with the first value; an empty map and its clones allocate nothing.
-    inner: Option<Box<HeaderEntries>>,
+    inner: HeaderStorage,
 }
 
-// Header-map equality compares each name's values, as the JSON object representation does.
-// Wire order is available through iter_ordered and is retained independently of this comparison.
+#[derive(Clone, Debug)]
+enum HeaderStorage {
+    Indexed(HashMap<HeaderName, Vec<HeaderValue>>),
+    Projection(Arc<HeaderProjection>),
+}
+
+impl Default for HeaderStorage {
+    fn default() -> Self {
+        Self::Indexed(HashMap::new())
+    }
+}
+
+#[derive(Debug)]
+enum TransportHeaders {
+    Received(ReceivedHeaders),
+    Ordered(OrderedHeaders),
+}
+
+#[derive(Debug)]
+struct ReceivedHeaders {
+    text: HeaderText,
+    pairs: smallvec::SmallVec<[HeaderIndex; 1]>,
+}
+
+#[derive(Debug)]
+struct HeaderIndex {
+    name_start: u32,
+    name_end: u32,
+    value_start: u32,
+    value_end: u32,
+}
+
+#[derive(Debug)]
+struct OrderedHeaders {
+    pairs: Vec<(String, String)>,
+    message_id: Option<HeaderValue>,
+    expected_stream: Option<HeaderValue>,
+}
+
+#[derive(Debug)]
+struct HeaderProjection {
+    data: TransportHeaders,
+    indexed: OnceLock<HashMap<HeaderName, Vec<HeaderValue>>>,
+}
+
 impl PartialEq for HeaderMap {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.inner, &other.inner) {
-            (Some(left), Some(right)) => {
-                left.keys_len() == right.keys_len()
-                    && left.keys().all(|name| {
-                        let right_values = right.get_all(name);
-                        right_values.len() != 0
-                            && GetAll::from_entries(left.get_all(name))
-                                .eq(GetAll::from_entries(right_values))
-                    })
-            }
-            (None, None) => true,
-            (Some(values), None) | (None, Some(values)) => values.is_empty(),
-        }
+        self.indexed() == other.indexed()
     }
 }
 
 impl Eq for HeaderMap {}
+
+impl HeaderMap {
+    fn indexed(&self) -> &HashMap<HeaderName, Vec<HeaderValue>> {
+        let cache = match &self.inner {
+            HeaderStorage::Indexed(values) => return values,
+            HeaderStorage::Projection(projection) => &projection.indexed,
+        };
+        cache.get_or_init(|| {
+            let mut values = HashMap::<HeaderName, Vec<HeaderValue>>::new();
+            for (name, value) in self.iter_ordered() {
+                values
+                    .entry(HeaderName::from_str(name).expect("validated header name"))
+                    .or_default()
+                    .push(HeaderValue::from(value));
+            }
+            values
+        })
+    }
+
+    fn indexed_mut(&mut self) -> &mut HashMap<HeaderName, Vec<HeaderValue>> {
+        if !matches!(&self.inner, HeaderStorage::Indexed(_)) {
+            self.inner = HeaderStorage::Indexed(self.indexed().clone());
+        }
+        match &mut self.inner {
+            HeaderStorage::Indexed(values) => values,
+            HeaderStorage::Projection(_) => unreachable!(),
+        }
+    }
+
+    /// Take ownership of already ordered transport pairs. No names, values or encoded bytes
+    /// are copied, so payload-size validation still precedes wire-buffer allocation.
+    pub fn from_ordered(pairs: Vec<(String, String)>) -> Self {
+        if pairs.is_empty() {
+            return Self::new();
+        }
+        for (name, value) in &pairs {
+            assert!(validate_header_name(name).is_ok(), "invalid header name");
+            assert!(validate_header_value(value).is_ok(), "invalid header value");
+        }
+        Self {
+            inner: HeaderStorage::Projection(Arc::new(HeaderProjection {
+                data: TransportHeaders::Ordered(OrderedHeaders {
+                    pairs,
+                    message_id: None,
+                    expected_stream: None,
+                }),
+                indexed: OnceLock::new(),
+            })),
+        }
+    }
+
+    /// Stream publication keeps its reserved overrides outside the owned ordered vector,
+    /// avoiding a vector growth or copying the caller's names and values before size admission.
+    pub fn from_ordered_with_stream(
+        mut pairs: Vec<(String, String)>,
+        message_id: Option<String>,
+        stream: String,
+    ) -> Self {
+        pairs.retain(|(name, _)| {
+            name != NATS_EXPECTED_STREAM.as_str()
+                && (message_id.is_none() || name != NATS_MESSAGE_ID.as_str())
+        });
+        if pairs.is_empty() {
+            let mut headers = Self::new();
+            if let Some(id) = message_id {
+                headers.insert(NATS_MESSAGE_ID, id);
+            }
+            headers.insert(NATS_EXPECTED_STREAM, stream);
+            return headers;
+        }
+        let mut headers = Self::from_ordered(pairs);
+        let HeaderStorage::Projection(ordered) = &mut headers.inner else {
+            unreachable!()
+        };
+        let TransportHeaders::Ordered(data) = &mut Arc::get_mut(ordered)
+            .expect("new projection is exclusively owned")
+            .data
+        else {
+            unreachable!()
+        };
+        data.message_id = message_id.map(HeaderValue::from);
+        data.expected_stream = Some(HeaderValue::from(stream));
+        headers
+    }
+
+    /// Validate and index the received block without copying names or values. A NATS server's
+    /// signed 32-bit payload bound fits these offsets. The conversion remains checked for peers
+    /// that violate that transport contract. Continuations are folded in the existing frame.
+    pub(crate) fn from_received(mut block: BytesMut) -> std::io::Result<Self> {
+        fn offset(value: usize) -> std::io::Result<u32> {
+            u32::try_from(value)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+        }
+        let text = std::str::from_utf8(&block)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let origin = text.as_ptr() as usize;
+        let mut lines = text.lines().skip(1).peekable();
+        let mut pairs = smallvec::SmallVec::<[HeaderIndex; 1]>::new();
+        while let Some(line) = lines.next() {
+            if line.is_empty() {
+                continue;
+            }
+            let (name, value) = line.split_once(':').ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no header version line found",
+                )
+            })?;
+            validate_header_name(name)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            let name_start = name.as_ptr() as usize - origin;
+            let value = value.trim_start();
+            let value_start = value.as_ptr() as usize - origin;
+            let mut raw_end = value_start + value.len();
+            while let Some(continuation) =
+                lines.next_if(|line| line.starts_with(char::is_whitespace))
+            {
+                raw_end = continuation.as_ptr() as usize - origin + continuation.len();
+            }
+            let value_end = value_start + text[value_start..raw_end].trim_end().len();
+            pairs.push(HeaderIndex {
+                name_start: offset(name_start)?,
+                name_end: offset(name_start + name.len())?,
+                value_start: offset(value_start)?,
+                value_end: offset(value_end)?,
+            });
+        }
+        if pairs.is_empty() {
+            return Ok(Self::new());
+        }
+        for pair in &mut pairs {
+            let start = pair.value_start as usize;
+            let end = pair.value_end as usize;
+            let mut read = start;
+            let mut written = start;
+            while read < end {
+                let newline = memchr::memchr(b'\n', &block[read..end]).map(|offset| read + offset);
+                let next = newline.unwrap_or(end);
+                let content_end = if newline.is_some() && next > read && block[next - 1] == b'\r' {
+                    next - 1
+                } else {
+                    next
+                };
+                if memchr::memchr(b'\r', &block[read..content_end]).is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        ParseHeaderValueError,
+                    ));
+                }
+                if written != read {
+                    block.copy_within(read..content_end, written);
+                }
+                written += content_end - read;
+                read = newline.map_or(end, |position| position + 1);
+            }
+            // Both the copied prefix and untouched suffix end at UTF-8 boundaries. Erase the
+            // abandoned continuation bytes so the complete immutable block also stays UTF-8.
+            if written < end {
+                block[written..end].fill(b' ');
+            }
+            pair.value_end = offset(written)?;
+        }
+        Ok(Self {
+            inner: HeaderStorage::Projection(Arc::new(HeaderProjection {
+                data: TransportHeaders::Received(ReceivedHeaders {
+                    text: HeaderText {
+                        bytes: block.freeze(),
+                    },
+                    pairs,
+                }),
+                indexed: OnceLock::new(),
+            })),
+        })
+    }
+
+    /// Borrow the first value without constructing the indexed SDK projection.
+    pub fn get_str(&self, name: &'static str) -> Option<&str> {
+        match &self.inner {
+            HeaderStorage::Indexed(values) => values
+                .get(&HeaderName::from_static(name))?
+                .first()
+                .map(HeaderValue::as_str),
+            HeaderStorage::Projection(_) => self
+                .iter_ordered()
+                .find_map(|(key, value)| (key == name).then_some(value)),
+        }
+    }
+
+    /// Borrow every pair in its transport position. Indexed authoring maps group their values.
+    pub fn iter_ordered(&self) -> HeaderPairs<'_> {
+        HeaderPairs {
+            inner: match &self.inner {
+                HeaderStorage::Indexed(values) => HeaderPairsInner::Indexed {
+                    entries: values.iter(),
+                    values: None,
+                },
+                HeaderStorage::Projection(projection) => match &projection.data {
+                    TransportHeaders::Received(block) => HeaderPairsInner::Block {
+                        text: block.text.as_str(),
+                        pairs: block.pairs.iter(),
+                    },
+                    TransportHeaders::Ordered(pairs) => HeaderPairsInner::Ordered {
+                        pairs: pairs.pairs.iter(),
+                        message_id: pairs.message_id.as_ref(),
+                        expected_stream: pairs.expected_stream.as_ref(),
+                    },
+                },
+            },
+        }
+    }
+}
+
+/// Borrowed header pairs; constructing or walking it allocates no storage.
+pub struct HeaderPairs<'a> {
+    inner: HeaderPairsInner<'a>,
+}
+
+enum HeaderPairsInner<'a> {
+    Indexed {
+        entries: std::collections::hash_map::Iter<'a, HeaderName, Vec<HeaderValue>>,
+        values: Option<(&'a HeaderName, std::slice::Iter<'a, HeaderValue>)>,
+    },
+    Block {
+        text: &'a str,
+        pairs: std::slice::Iter<'a, HeaderIndex>,
+    },
+    Ordered {
+        pairs: std::slice::Iter<'a, (String, String)>,
+        message_id: Option<&'a HeaderValue>,
+        expected_stream: Option<&'a HeaderValue>,
+    },
+}
+
+impl<'a> Iterator for HeaderPairs<'a> {
+    type Item = (&'a str, &'a str);
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            HeaderPairsInner::Indexed { entries, values } => loop {
+                if let Some((name, current)) = values {
+                    if let Some(value) = current.next() {
+                        return Some((name.as_str(), value.as_str()));
+                    }
+                }
+                let (name, current) = entries.next()?;
+                *values = Some((name, current.iter()));
+            },
+            HeaderPairsInner::Block { text, pairs } => pairs.next().map(|pair| {
+                (
+                    &text[pair.name_start as usize..pair.name_end as usize],
+                    &text[pair.value_start as usize..pair.value_end as usize],
+                )
+            }),
+            HeaderPairsInner::Ordered {
+                pairs,
+                message_id,
+                expected_stream,
+            } => pairs
+                .next()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .or_else(|| {
+                    message_id
+                        .take()
+                        .map(|value| (NATS_MESSAGE_ID.as_str(), value.as_str()))
+                })
+                .or_else(|| {
+                    expected_stream
+                        .take()
+                        .map(|value| (NATS_EXPECTED_STREAM.as_str(), value.as_str()))
+                }),
+        }
+    }
+}
 
 /// Helper enum for backward-compatible deserialization using serde's untagged feature
 /// This is required because of the bug #1470 where the client incorrectly serialized
@@ -98,24 +402,14 @@ impl<'de> Deserialize<'de> for HeaderMap {
         // Use the untagged enum to automatically try both formats
         let helper = HeaderMapHelper::deserialize(deserializer)?;
 
-        let pairs = match helper {
-            HeaderMapHelper::Legacy { inner } => inner,
-            HeaderMapHelper::Current(inner) => inner,
-        };
-        let mut headers = HeaderMap::new();
-        for (name, values) in pairs {
-            if values.is_empty() {
-                headers
-                    .inner
-                    .get_or_insert_with(Default::default)
-                    .append(name, None);
-                continue;
-            }
-            for value in values {
-                headers.append(name.clone(), value);
-            }
-        }
-        Ok(headers)
+        Ok(match helper {
+            HeaderMapHelper::Legacy { inner } => HeaderMap {
+                inner: HeaderStorage::Indexed(inner),
+            },
+            HeaderMapHelper::Current(inner) => HeaderMap {
+                inner: HeaderStorage::Indexed(inner),
+            },
+        })
     }
 }
 
@@ -124,32 +418,8 @@ impl Serialize for HeaderMap {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(self.len()))?;
-        if let Some(inner) = &self.inner {
-            for name in inner.keys() {
-                map.serialize_entry(name, &HeaderValues { inner, name })?;
-            }
-        }
-        map.end()
-    }
-}
-
-struct HeaderValues<'a> {
-    inner: &'a HeaderEntries,
-    name: &'a HeaderName,
-}
-
-impl Serialize for HeaderValues<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let values = GetAll::from_entries(self.inner.get_all(self.name));
-        let mut sequence = serializer.serialize_seq(Some(values.len()))?;
-        for value in values {
-            sequence.serialize_element(value)?;
-        }
-        sequence.end()
+        // Serialize as the new format (direct HashMap without "inner" wrapper)
+        self.indexed().serialize(serializer)
     }
 }
 
@@ -164,57 +434,24 @@ impl FromIterator<(HeaderName, HeaderValue)> for HeaderMap {
 }
 
 impl HeaderMap {
-    /// Each name with its values in insertion order. Use [`Self::iter_ordered`] to retain
-    /// interleaving between names.
-    pub fn iter(&self) -> impl Iterator<Item = (&HeaderName, GetAll<'_, HeaderValue>)> {
-        self.inner.iter().flat_map(|inner| {
-            inner
-                .keys()
-                .map(move |name| (name, GetAll::from_entries(inner.get_all(name))))
-        })
-    }
-
-    /// Every header pair in insertion order, including interleaved repeated names.
-    pub fn iter_ordered(&self) -> impl Iterator<Item = (&HeaderName, &HeaderValue)> {
-        self.inner
-            .iter()
-            .flat_map(|inner| inner.iter())
-            .filter_map(|(name, value)| value.as_ref().map(|value| (name, value)))
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, HeaderName, Vec<HeaderValue>> {
+        self.indexed().iter()
     }
 }
 
 pub struct GetAll<'a, T> {
-    inner: Option<EntryValues<'a, HeaderName, Option<T>>>,
-    remaining: usize,
-}
-
-impl<'a, T: Clone> GetAll<'a, T> {
-    fn from_entries(entries: EntryValues<'a, HeaderName, Option<T>>) -> Self {
-        // A JSON key with an empty array has one leading presence marker. Appended values follow
-        // it, and every actual value contributes exactly once to the public iterator.
-        let presence = entries.clone().next().is_some_and(Option::is_none);
-        let remaining = entries.len() - usize::from(presence);
-        Self {
-            inner: Some(entries),
-            remaining,
-        }
-    }
+    inner: Iter<'a, T>,
 }
 
 impl<'a, T> Iterator for GetAll<'a, T> {
     type Item = &'a T;
-
     fn next(&mut self) -> Option<Self::Item> {
-        let value = self.inner.as_mut()?.find_map(Option::as_ref)?;
-        self.remaining -= 1;
-        Some(value)
+        self.inner.next()
     }
-
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        self.inner.size_hint()
     }
 }
-
 impl<T> ExactSizeIterator for GetAll<'_, T> {}
 
 impl HeaderMap {
@@ -248,22 +485,24 @@ impl HeaderMap {
     /// assert!(!map.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.inner.as_ref().is_none_or(|inner| inner.is_empty())
+        match &self.inner {
+            HeaderStorage::Indexed(values) => values.is_empty(),
+            HeaderStorage::Projection(_) => false,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.as_ref().map_or(0, |inner| inner.keys_len())
+        self.indexed().len()
     }
 
     /// Serialized byte length of this header block (as [`HeaderMap::to_bytes`]
     /// produces), computed without allocating.
     pub(crate) fn wire_len(&self) -> usize {
-        // Mirrors `to_bytes`: "NATS/1.0\r\n" + each "<key>: <value>\r\n" + "\r\n".
-        let mut len = b"NATS/1.0\r\n".len() + b"\r\n".len();
-        for (k, v) in self.iter_ordered() {
-            len += k.as_str().len() + b": ".len() + v.inner.len() + b"\r\n".len();
-        }
-        len
+        b"NATS/1.0\r\n\r\n".len()
+            + self
+                .iter_ordered()
+                .map(|(name, value)| name.len() + value.len() + 4)
+                .sum::<usize>()
     }
 }
 
@@ -281,9 +520,7 @@ impl HeaderMap {
     pub fn insert<K: IntoHeaderName, V: IntoHeaderValue>(&mut self, name: K, value: V) {
         let name = name.into_header_name();
         let value = value.into_header_value();
-        self.inner
-            .get_or_insert_with(Default::default)
-            .insert_all(name, Some(value));
+        self.indexed_mut().insert(name, vec![value]);
     }
 
     /// Appends a new value to the list of values to a given key.
@@ -298,11 +535,17 @@ impl HeaderMap {
     /// headers.append("Key", "Value");
     /// headers.append("Key", "Another");
     pub fn append<K: IntoHeaderName, V: IntoHeaderValue>(&mut self, name: K, value: V) {
-        let name = name.into_header_name();
+        let key = name.into_header_name();
         let value = value.into_header_value();
-        self.inner
-            .get_or_insert_with(Default::default)
-            .append(name, Some(value));
+        let v = self.indexed_mut().get_mut(&key);
+        match v {
+            Some(v) => {
+                v.push(value);
+            }
+            None => {
+                self.insert(key, value);
+            }
+        }
     }
 
     /// Gets a value for a given key. If key is not found, [Option::None] is returned.
@@ -317,8 +560,9 @@ impl HeaderMap {
     /// let values = headers.get("Key").unwrap();
     /// ```
     pub fn get<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        let key = key.into_header_name();
-        self.inner.as_ref()?.get_all(&key).find_map(Option::as_ref)
+        self.indexed()
+            .get(&key.into_header_name())
+            .and_then(|x| x.first())
     }
 
     /// Gets a last value for a given key. If key is not found, [Option::None] is returned.
@@ -333,12 +577,9 @@ impl HeaderMap {
     /// let values = headers.get_last("Key").unwrap();
     /// ```
     pub fn get_last<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        let key = key.into_header_name();
-        self.inner
-            .as_ref()?
-            .get_all(&key)
-            .rev()
-            .find_map(Option::as_ref)
+        self.indexed()
+            .get(&key.into_header_name())
+            .and_then(|x| x.last())
     }
 
     /// Gets an iterator to the values for a given key.
@@ -356,23 +597,25 @@ impl HeaderMap {
     /// let value2 = values.next();
     /// ```
     pub fn get_all<K: IntoHeaderName>(&self, key: K) -> GetAll<'_, HeaderValue> {
-        let key = key.into_header_name();
-        match self.inner.as_ref() {
-            Some(inner) => GetAll::from_entries(inner.get_all(&key)),
-            None => GetAll {
-                inner: None,
-                remaining: 0,
-            },
-        }
+        let inner = self
+            .indexed()
+            .get(&key.into_header_name())
+            .map(|x| x.iter())
+            .unwrap_or([].iter());
+
+        GetAll { inner }
     }
 
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = vec![];
+        let mut buf = match &self.inner {
+            HeaderStorage::Indexed(_) => Vec::new(),
+            HeaderStorage::Projection(_) => Vec::with_capacity(self.wire_len()),
+        };
         buf.extend_from_slice(b"NATS/1.0\r\n");
-        for (k, v) in self.iter_ordered() {
-            buf.extend_from_slice(k.as_str().as_bytes());
+        for (name, value) in self.iter_ordered() {
+            buf.extend_from_slice(name.as_bytes());
             buf.extend_from_slice(b": ");
-            buf.extend_from_slice(v.inner.as_bytes());
+            buf.extend_from_slice(value.as_bytes());
             buf.extend_from_slice(b"\r\n");
         }
         buf.extend_from_slice(b"\r\n");
@@ -756,37 +999,39 @@ pub const NATS_SCHEDULE_DAILY: &str = "@daily";
 pub const NATS_SCHEDULE_HOURLY: &str = "@hourly";
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
-struct CustomHeader {
+struct HeaderText {
     bytes: Bytes,
 }
 
-impl CustomHeader {
+impl HeaderText {
     #[inline]
-    pub(crate) const fn from_static(value: &'static str) -> CustomHeader {
-        CustomHeader {
+    pub(crate) const fn from_static(value: &'static str) -> HeaderText {
+        HeaderText {
             bytes: Bytes::from_static(value.as_bytes()),
         }
     }
 
     #[inline]
     pub(crate) fn as_str(&self) -> &str {
+        // Every constructor takes a string or a fully validated received block. Folding copies
+        // complete UTF-8 slices at ASCII delimiters, and publication makes these bytes immutable.
         unsafe { std::str::from_utf8_unchecked(self.bytes.as_ref()) }
     }
 }
 
-impl From<String> for CustomHeader {
+impl From<String> for HeaderText {
     #[inline]
-    fn from(value: String) -> CustomHeader {
-        CustomHeader {
+    fn from(value: String) -> HeaderText {
+        HeaderText {
             bytes: Bytes::from(value),
         }
     }
 }
 
-impl<'a> From<&'a str> for CustomHeader {
+impl<'a> From<&'a str> for HeaderText {
     #[inline]
-    fn from(value: &'a str) -> CustomHeader {
-        CustomHeader {
+    fn from(value: &'a str) -> HeaderText {
+        HeaderText {
             bytes: Bytes::copy_from_slice(value.as_bytes()),
         }
     }
@@ -795,7 +1040,7 @@ impl<'a> From<&'a str> for CustomHeader {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum HeaderRepr {
     Standard(StandardHeader),
-    Custom(CustomHeader),
+    Custom(HeaderText),
 }
 
 /// Defines a NATS header field name
@@ -823,7 +1068,7 @@ impl HeaderName {
         }
 
         HeaderName {
-            inner: HeaderRepr::Custom(CustomHeader::from_static(value)),
+            inner: HeaderRepr::Custom(HeaderText::from_static(value)),
         }
     }
 
@@ -847,7 +1092,7 @@ impl FromStr for HeaderName {
                 inner: HeaderRepr::Standard(v),
             },
             None => HeaderName {
-                inner: HeaderRepr::Custom(CustomHeader::from(s)),
+                inner: HeaderRepr::Custom(HeaderText::from(s)),
             },
         })
     }
@@ -874,7 +1119,7 @@ impl TryFrom<String> for HeaderName {
                 inner: HeaderRepr::Standard(v),
             },
             None => HeaderName {
-                inner: HeaderRepr::Custom(CustomHeader::from(value)),
+                inner: HeaderRepr::Custom(HeaderText::from(value)),
             },
         })
     }
@@ -943,6 +1188,214 @@ mod tests {
     use std::str::{from_utf8, FromStr};
 
     #[test]
+    fn transport_projection_keeps_the_indexed_map_footprint() {
+        assert_eq!(
+            std::mem::size_of::<HeaderMap>(),
+            std::mem::size_of::<std::collections::HashMap<HeaderName, Vec<HeaderValue>>>()
+        );
+    }
+
+    #[test]
+    fn owned_transport_pairs_move_without_copying_or_wire_allocation() {
+        for (names, repeats, name_len) in [(1, 1, 3), (1, 32, 8192), (16, 1, 3), (4, 8, 3)] {
+            let input = (0..names)
+                .flat_map(|name| {
+                    (0..repeats).map(move |_| {
+                        (
+                            format!("X-{name}{}", "n".repeat(name_len)),
+                            "value".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            let pointer = input.as_ptr();
+            let mut retained = None;
+            let allocated = allocation_counter::measure(|| {
+                let headers = HeaderMap::from_ordered(input);
+                assert_eq!(headers.iter_ordered().count(), names * repeats);
+                std::hint::black_box(headers.wire_len());
+                retained = Some(headers);
+            });
+            assert_eq!(allocated.count_total, 1);
+            assert_eq!(
+                allocated.bytes_total,
+                (std::mem::size_of::<super::HeaderProjection>() + 2 * std::mem::size_of::<usize>())
+                    as u64
+            );
+            let super::HeaderStorage::Projection(projection) = &retained.as_ref().unwrap().inner
+            else {
+                panic!("ordered projection");
+            };
+            let super::TransportHeaders::Ordered(pairs) = &projection.data else {
+                panic!("ordered pairs");
+            };
+            assert_eq!(pairs.pairs.as_ptr(), pointer);
+            assert!(projection.indexed.get().is_none());
+            let borrowed = allocation_counter::measure(|| {
+                std::hint::black_box(retained.as_ref().unwrap().clone());
+                std::hint::black_box(retained.as_ref().unwrap().iter_ordered().count());
+            });
+            assert_eq!(borrowed.count_total, 0);
+        }
+    }
+
+    #[test]
+    fn received_transport_headers_share_the_existing_frame_even_with_empty_payload() {
+        let name = format!("X-{}", "n".repeat(8192));
+        let wire = format!(
+            "NATS/1.0\r\n{}\r\n",
+            format!("{name}: value\r\n").repeat(32)
+        );
+        let mut frame = bytes::BytesMut::from(wire.as_bytes());
+        let block = frame.split_to(wire.len());
+        let pointer = block.as_ptr();
+        let payload = frame.split_to(0).freeze();
+        let mut retained = None;
+        let allocated = allocation_counter::measure(|| {
+            let headers = HeaderMap::from_received(block).unwrap();
+            assert_eq!(headers.iter_ordered().count(), 32);
+            retained = Some(headers);
+        });
+        assert!(allocated.count_total <= 6);
+        assert!(
+            allocated.bytes_total
+                <= (2 * 32 * std::mem::size_of::<super::HeaderIndex>()
+                    + std::mem::size_of::<super::HeaderProjection>()
+                    + 2 * std::mem::size_of::<usize>()) as u64
+        );
+        let super::HeaderStorage::Projection(projection) = &retained.as_ref().unwrap().inner else {
+            panic!("received block");
+        };
+        let super::TransportHeaders::Received(block) = &projection.data else {
+            panic!("received bytes");
+        };
+        assert_eq!(block.text.bytes.as_ptr(), pointer);
+        assert!(projection.indexed.get().is_none());
+        let borrowed = allocation_counter::measure(|| {
+            std::hint::black_box(retained.as_ref().unwrap().get_str("missing"));
+            std::hint::black_box(retained.as_ref().unwrap().iter_ordered().count());
+        });
+        assert_eq!(borrowed.count_total, 0);
+        drop(frame);
+        assert!(!payload.is_unique());
+        drop(retained);
+        assert!(payload.is_unique());
+    }
+
+    #[test]
+    fn received_folding_preserves_leading_continuation_space_and_empty_values() {
+        let wire = b"NATS/1.0\r\nfirst:   one  \r\n  continued \r\nsecond:  \r\n  after-empty  \r\nfirst: three  \r\nempty:\r\n\r\n";
+        let headers = HeaderMap::from_received(bytes::BytesMut::from(wire.as_slice())).unwrap();
+        assert_eq!(
+            headers.iter_ordered().collect::<Vec<_>>(),
+            [
+                ("first", "one    continued"),
+                ("second", "  after-empty"),
+                ("first", "three"),
+                ("empty", "")
+            ]
+        );
+        assert_eq!(headers.get_str("second"), Some("  after-empty"));
+        assert_eq!(
+            headers
+                .get_all("first")
+                .map(HeaderValue::as_str)
+                .collect::<Vec<_>>(),
+            ["one    continued", "three"]
+        );
+        assert_eq!(headers.wire_len(), headers.to_bytes().len());
+    }
+
+    #[test]
+    fn stream_transport_overrides_reserved_exact_names_and_preserves_other_repeats() {
+        let pairs = [
+            ("first", "one"),
+            ("Nats-Expected-Stream", "ignored"),
+            ("Nats-Msg-Id", "ignored-id"),
+            ("nats-msg-id", "case-sensitive"),
+            ("second", "two"),
+            ("first", "three"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+        let headers = HeaderMap::from_ordered_with_stream(
+            pairs,
+            Some("message-id".to_owned()),
+            "EVENTS".to_owned(),
+        );
+        assert_eq!(
+            headers.iter_ordered().collect::<Vec<_>>(),
+            [
+                ("first", "one"),
+                ("nats-msg-id", "case-sensitive"),
+                ("second", "two"),
+                ("first", "three"),
+                ("Nats-Msg-Id", "message-id"),
+                ("Nats-Expected-Stream", "EVENTS")
+            ]
+        );
+        assert_eq!(headers.wire_len(), headers.to_bytes().len());
+    }
+
+    #[test]
+    fn ordered_admission_allocates_less_than_indexed_authoring_for_populated_shapes() {
+        for (names, repeats, name_len, value_len) in [
+            (1, 1, 3, 5),
+            (1, 32, 8192, 5),
+            (16, 1, 3, 5),
+            (4, 8, 3, 5),
+            (1, 1, 3, 65536),
+        ] {
+            let input = (0..names)
+                .flat_map(|name| {
+                    (0..repeats).map(move |_| {
+                        (
+                            format!("X-{name}{}", "n".repeat(name_len)),
+                            "v".repeat(value_len),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut indexed = None;
+            let indexed_cost = allocation_counter::measure(|| {
+                let mut headers = HeaderMap::new();
+                for (name, value) in &input {
+                    headers.append(name.as_str(), value.as_str());
+                }
+                std::hint::black_box(headers.wire_len());
+                indexed = Some(headers);
+            });
+            let mut ordered = None;
+            let ordered_cost = allocation_counter::measure(|| {
+                let headers = HeaderMap::from_ordered(input);
+                std::hint::black_box(headers.wire_len());
+                ordered = Some(headers);
+            });
+            println!("shape names={names} repeats={repeats} name_len={name_len} value_len={value_len}: indexed={indexed_cost:?}; ordered={ordered_cost:?}");
+            assert!(ordered_cost.count_total < indexed_cost.count_total);
+            assert!(ordered_cost.bytes_total < indexed_cost.bytes_total);
+            assert_eq!(
+                ordered.as_ref().unwrap().wire_len(),
+                indexed.as_ref().unwrap().wire_len()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_received_names_values_and_utf8_keep_their_typed_cause() {
+        for wire in [
+            b"NATS/1.0\r\nBad Name: x\r\n\r\n".as_slice(),
+            b"NATS/1.0\r\nvalid: embedded\rcarriage\r\n\r\n".as_slice(),
+            b"NATS/1.0\r\nvalid: \xff\r\n\r\n".as_slice(),
+        ] {
+            let error = HeaderMap::from_received(bytes::BytesMut::from(wire)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.get_ref().is_some());
+        }
+    }
+
+    #[test]
     fn allocations_empty_maps_and_their_clones_need_no_storage() {
         let allocated = allocation_counter::measure(|| {
             let headers = std::hint::black_box(HeaderMap::new());
@@ -989,10 +1442,12 @@ mod tests {
 
     #[test]
     fn interleaved_headers_keep_wire_order() {
-        let mut headers = HeaderMap::new();
-        headers.append("first", "one");
-        headers.append("second", "two");
-        headers.append("first", "three");
+        let headers = HeaderMap::from_ordered(
+            [("first", "one"), ("second", "two"), ("first", "three")]
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect(),
+        );
         assert_eq!(
             headers.to_bytes(),
             b"NATS/1.0\r\nfirst: one\r\nsecond: two\r\nfirst: three\r\n\r\n"

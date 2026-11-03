@@ -1197,8 +1197,8 @@ impl futures_util::Stream for Stream {
                                 let pending_messages = message
                                     .headers
                                     .as_ref()
-                                    .and_then(|headers| headers.get("Nats-Pending-Messages"))
-                                    .map_or(Ok(self.batch_config.batch), |x| x.as_str().parse())
+                                    .and_then(|headers| headers.get_str("Nats-Pending-Messages"))
+                                    .map_or(Ok(self.batch_config.batch), |x| x.parse())
                                     .map_err(|err| {
                                         MessagesError::with_source(MessagesErrorKind::Other, err)
                                     })?;
@@ -1206,8 +1206,8 @@ impl futures_util::Stream for Stream {
                                 let pending_bytes = message
                                     .headers
                                     .as_ref()
-                                    .and_then(|headers| headers.get("Nats-Pending-Bytes"))
-                                    .map_or(Ok(self.batch_config.max_bytes), |x| x.as_str().parse())
+                                    .and_then(|headers| headers.get_str("Nats-Pending-Bytes"))
+                                    .map_or(Ok(self.batch_config.max_bytes), |x| x.parse())
                                     .map_err(|err| {
                                         MessagesError::with_source(MessagesErrorKind::Other, err)
                                     })?;

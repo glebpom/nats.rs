@@ -1056,6 +1056,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
             ignore_discovered_servers: options.ignore_discovered_servers,
             retain_servers_order: options.retain_servers_order,
             read_buffer_capacity: options.read_buffer_capacity,
+            ordered_headers: options.ordered_headers,
             reconnect_delay_callback: options.reconnect_delay_callback,
             auth_callback: options.auth_callback,
             max_reconnects: options.max_reconnects,

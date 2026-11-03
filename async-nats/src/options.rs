@@ -65,6 +65,7 @@ pub struct ConnectOptions {
     pub(crate) ignore_discovered_servers: bool,
     pub(crate) retain_servers_order: bool,
     pub(crate) read_buffer_capacity: u16,
+    pub(crate) ordered_headers: bool,
     pub(crate) reconnect_delay_callback: Arc<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
     pub(crate) skip_subject_validation: bool,
@@ -118,6 +119,7 @@ impl Default for ConnectOptions {
             ignore_discovered_servers: false,
             retain_servers_order: false,
             read_buffer_capacity: 65535,
+            ordered_headers: false,
             reconnect_delay_callback: Arc::new(|attempts| {
                 connector::reconnect_delay_callback_default(attempts)
             }),
@@ -147,6 +149,14 @@ impl ConnectOptions {
     /// ```
     pub fn new() -> ConnectOptions {
         ConnectOptions::default()
+    }
+
+    /// Retain received header pairs in wire order as a compact transport projection.
+    /// Borrow them with `HeaderMap::iter_ordered` or `HeaderMap::get_str`; typed map access
+    /// constructs an indexed projection only when requested.
+    pub fn ordered_headers(mut self) -> Self {
+        self.ordered_headers = true;
+        self
     }
 
     /// Connect to the NATS Server leveraging all passed options.
