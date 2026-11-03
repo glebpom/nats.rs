@@ -830,6 +830,15 @@ mod metadata_tests {
     use super::Info;
 
     #[test]
+    fn a_valid_delivery_info_parse_allocates_nothing() {
+        let subject = "$JS.ACK._.account.orders.reader.2.7.3.1730000000000000000.4.token";
+        let allocated = allocation_counter::measure(|| {
+            std::hint::black_box(Info::from_reply(subject).unwrap());
+        });
+        assert_eq!(allocated.count_total, 0);
+    }
+
+    #[test]
     fn delivery_counts_keep_the_complete_unsigned_range() {
         let subject = "$JS.ACK._.account.orders.reader.18446744073709551615.18446744073709551615.3.1730000000000000000.0.token";
         let info = Info::from_reply(subject).unwrap();

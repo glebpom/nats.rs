@@ -24,8 +24,10 @@ use std::{collections::HashMap, fmt, str::FromStr};
 
 use bytes::Bytes;
 use ordered_multimap::{list_ordered_multimap::EntryValues, ListOrderedMultimap};
-use serde::ser::SerializeMap as _;
+use serde::ser::{SerializeMap as _, SerializeSeq as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+type HeaderEntries = ListOrderedMultimap<HeaderName, Option<HeaderValue>>;
 
 /// A struct for handling NATS headers.
 /// Has a similar API to `http::header`, but properly serializes and deserializes
@@ -48,20 +50,27 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMap {
-    // Keep the optional header block small inside each Message while retaining indexed lookup
-    // and the complete pair order.
-    inner: Box<ListOrderedMultimap<HeaderName, HeaderValue>>,
+    // Storage starts with the first value; an empty map and its clones allocate nothing.
+    inner: Option<Box<HeaderEntries>>,
 }
 
 // Header-map equality compares each name's values, as the JSON object representation does.
 // Wire order is available through iter_ordered and is retained independently of this comparison.
 impl PartialEq for HeaderMap {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len()
-            && self
-                .inner
-                .keys()
-                .all(|name| self.inner.get_all(name).eq(other.inner.get_all(name)))
+        match (&self.inner, &other.inner) {
+            (Some(left), Some(right)) => {
+                left.keys_len() == right.keys_len()
+                    && left.keys().all(|name| {
+                        let right_values = right.get_all(name);
+                        right_values.len() != 0
+                            && GetAll::from_entries(left.get_all(name))
+                                .eq(GetAll::from_entries(right_values))
+                    })
+            }
+            (None, None) => true,
+            (Some(values), None) | (None, Some(values)) => values.is_empty(),
+        }
     }
 }
 
@@ -95,6 +104,13 @@ impl<'de> Deserialize<'de> for HeaderMap {
         };
         let mut headers = HeaderMap::new();
         for (name, values) in pairs {
+            if values.is_empty() {
+                headers
+                    .inner
+                    .get_or_insert_with(Default::default)
+                    .append(name, None);
+                continue;
+            }
             for value in values {
                 headers.append(name.clone(), value);
             }
@@ -109,10 +125,31 @@ impl Serialize for HeaderMap {
         S: Serializer,
     {
         let mut map = serializer.serialize_map(Some(self.len()))?;
-        for (name, values) in self.iter() {
-            map.serialize_entry(name, &values.collect::<Vec<_>>())?;
+        if let Some(inner) = &self.inner {
+            for name in inner.keys() {
+                map.serialize_entry(name, &HeaderValues { inner, name })?;
+            }
         }
         map.end()
+    }
+}
+
+struct HeaderValues<'a> {
+    inner: &'a HeaderEntries,
+    name: &'a HeaderName,
+}
+
+impl Serialize for HeaderValues<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let values = GetAll::from_entries(self.inner.get_all(self.name));
+        let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+        for value in values {
+            sequence.serialize_element(value)?;
+        }
+        sequence.end()
     }
 }
 
@@ -130,33 +167,55 @@ impl HeaderMap {
     /// Each name with its values in insertion order. Use [`Self::iter_ordered`] to retain
     /// interleaving between names.
     pub fn iter(&self) -> impl Iterator<Item = (&HeaderName, GetAll<'_, HeaderValue>)> {
-        self.inner.keys().map(|name| {
-            (
-                name,
-                GetAll {
-                    inner: self.inner.get_all(name),
-                },
-            )
+        self.inner.iter().flat_map(|inner| {
+            inner
+                .keys()
+                .map(move |name| (name, GetAll::from_entries(inner.get_all(name))))
         })
     }
 
     /// Every header pair in insertion order, including interleaved repeated names.
     pub fn iter_ordered(&self) -> impl Iterator<Item = (&HeaderName, &HeaderValue)> {
-        self.inner.iter()
+        self.inner
+            .iter()
+            .flat_map(|inner| inner.iter())
+            .filter_map(|(name, value)| value.as_ref().map(|value| (name, value)))
     }
 }
 
 pub struct GetAll<'a, T> {
-    inner: EntryValues<'a, HeaderName, T>,
+    inner: Option<EntryValues<'a, HeaderName, Option<T>>>,
+    remaining: usize,
+}
+
+impl<'a, T: Clone> GetAll<'a, T> {
+    fn from_entries(entries: EntryValues<'a, HeaderName, Option<T>>) -> Self {
+        // A JSON key with an empty array has one leading presence marker. Appended values follow
+        // it, and every actual value contributes exactly once to the public iterator.
+        let presence = entries.clone().next().is_some_and(Option::is_none);
+        let remaining = entries.len() - usize::from(presence);
+        Self {
+            inner: Some(entries),
+            remaining,
+        }
+    }
 }
 
 impl<'a, T> Iterator for GetAll<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        let value = self.inner.as_mut()?.find_map(Option::as_ref)?;
+        self.remaining -= 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
     }
 }
+
+impl<T> ExactSizeIterator for GetAll<'_, T> {}
 
 impl HeaderMap {
     /// Create an empty `HeaderMap`.
@@ -189,11 +248,11 @@ impl HeaderMap {
     /// assert!(!map.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.as_ref().is_none_or(|inner| inner.is_empty())
     }
 
     pub fn len(&self) -> usize {
-        self.inner.keys_len()
+        self.inner.as_ref().map_or(0, |inner| inner.keys_len())
     }
 
     /// Serialized byte length of this header block (as [`HeaderMap::to_bytes`]
@@ -201,7 +260,7 @@ impl HeaderMap {
     pub(crate) fn wire_len(&self) -> usize {
         // Mirrors `to_bytes`: "NATS/1.0\r\n" + each "<key>: <value>\r\n" + "\r\n".
         let mut len = b"NATS/1.0\r\n".len() + b"\r\n".len();
-        for (k, v) in self.inner.iter() {
+        for (k, v) in self.iter_ordered() {
             len += k.as_str().len() + b": ".len() + v.inner.len() + b"\r\n".len();
         }
         len
@@ -220,8 +279,11 @@ impl HeaderMap {
     /// headers.insert("Key", "Value");
     /// ```
     pub fn insert<K: IntoHeaderName, V: IntoHeaderValue>(&mut self, name: K, value: V) {
+        let name = name.into_header_name();
+        let value = value.into_header_value();
         self.inner
-            .insert_all(name.into_header_name(), value.into_header_value());
+            .get_or_insert_with(Default::default)
+            .insert_all(name, Some(value));
     }
 
     /// Appends a new value to the list of values to a given key.
@@ -236,8 +298,11 @@ impl HeaderMap {
     /// headers.append("Key", "Value");
     /// headers.append("Key", "Another");
     pub fn append<K: IntoHeaderName, V: IntoHeaderValue>(&mut self, name: K, value: V) {
+        let name = name.into_header_name();
+        let value = value.into_header_value();
         self.inner
-            .append(name.into_header_name(), value.into_header_value());
+            .get_or_insert_with(Default::default)
+            .append(name, Some(value));
     }
 
     /// Gets a value for a given key. If key is not found, [Option::None] is returned.
@@ -252,7 +317,8 @@ impl HeaderMap {
     /// let values = headers.get("Key").unwrap();
     /// ```
     pub fn get<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        self.inner.get(&key.into_header_name())
+        let key = key.into_header_name();
+        self.inner.as_ref()?.get_all(&key).find_map(Option::as_ref)
     }
 
     /// Gets a last value for a given key. If key is not found, [Option::None] is returned.
@@ -267,7 +333,12 @@ impl HeaderMap {
     /// let values = headers.get_last("Key").unwrap();
     /// ```
     pub fn get_last<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
-        self.inner.get_all(&key.into_header_name()).next_back()
+        let key = key.into_header_name();
+        self.inner
+            .as_ref()?
+            .get_all(&key)
+            .rev()
+            .find_map(Option::as_ref)
     }
 
     /// Gets an iterator to the values for a given key.
@@ -285,15 +356,20 @@ impl HeaderMap {
     /// let value2 = values.next();
     /// ```
     pub fn get_all<K: IntoHeaderName>(&self, key: K) -> GetAll<'_, HeaderValue> {
-        let inner = self.inner.get_all(&key.into_header_name());
-
-        GetAll { inner }
+        let key = key.into_header_name();
+        match self.inner.as_ref() {
+            Some(inner) => GetAll::from_entries(inner.get_all(&key)),
+            None => GetAll {
+                inner: None,
+                remaining: 0,
+            },
+        }
     }
 
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![];
         buf.extend_from_slice(b"NATS/1.0\r\n");
-        for (k, v) in self.inner.iter() {
+        for (k, v) in self.iter_ordered() {
             buf.extend_from_slice(k.as_str().as_bytes());
             buf.extend_from_slice(b": ");
             buf.extend_from_slice(v.inner.as_bytes());
@@ -865,6 +941,51 @@ fn validate_header_name(s: &str) -> Result<(), ParseHeaderNameError> {
 mod tests {
     use super::{HeaderMap, HeaderName, HeaderValue, IntoHeaderName, IntoHeaderValue};
     use std::str::{from_utf8, FromStr};
+
+    #[test]
+    fn allocations_empty_maps_and_their_clones_need_no_storage() {
+        let allocated = allocation_counter::measure(|| {
+            let headers = std::hint::black_box(HeaderMap::new());
+            std::hint::black_box(headers.clone());
+        });
+        assert_eq!(allocated.count_total, 0);
+    }
+
+    #[test]
+    fn allocations_serialization_streams_each_names_values() {
+        let mut headers = HeaderMap::new();
+        headers.append("first", "one");
+        headers.append("second", "two");
+        headers.append("first", "three");
+        let allocated = allocation_counter::measure(|| {
+            serde_json::to_writer(std::io::sink(), &headers).expect("valid header values");
+        });
+        assert_eq!(allocated.count_total, 0);
+    }
+
+    #[test]
+    fn an_empty_json_header_key_keeps_its_presence_and_accepts_values() {
+        let mut headers: HeaderMap = serde_json::from_str(r#"{"empty":[]}"#).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert!(!headers.is_empty());
+        assert_eq!(headers.get_all("empty").count(), 0);
+        assert_eq!(
+            serde_json::to_value(&headers).unwrap(),
+            serde_json::json!({"empty": []})
+        );
+        let other: HeaderMap = serde_json::from_str(r#"{"different":[]}"#).unwrap();
+        assert_ne!(headers, other);
+        headers.append("empty", "first");
+        assert_eq!(headers.get("empty").unwrap().as_str(), "first");
+        assert_eq!(
+            headers
+                .get_all("empty")
+                .map(HeaderValue::as_str)
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        assert_eq!(headers.to_bytes(), b"NATS/1.0\r\nempty: first\r\n\r\n");
+    }
 
     #[test]
     fn interleaved_headers_keep_wire_order() {

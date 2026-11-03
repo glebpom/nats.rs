@@ -46,6 +46,7 @@ tokio-websockets = { version = "0.10", default-features = false, features = ["cl
 pin-project = "1.0"
 
 [dev-dependencies]
+allocation-counter = "0.8.1"
 ring = "0.17"
 criterion =  { version = "0.5", features = ["async_tokio"]}
 nats-server = { path = "../nats-server" }
